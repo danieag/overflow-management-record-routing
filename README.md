@@ -13,11 +13,21 @@ The **Overflow** solution uses Power Automate and a dedicated model-driven app t
 
 For example, if Queue A has a work item limit of 10, the first 10 active unpicked work items remain in Queue A. When item 11 is added, the flow moves that newly arrived item to the configured overflow queue.
 
+Overflow rules can be chained: Queue A can overflow to Queue B, and Queue B can independently overflow to Queue C, each with its own work item limit. The flow walks this chain automatically within a single run, so an item that arrives when both Queue A and Queue B are already full lands directly in Queue C. See [Cascading overflow through multiple queues](#cascading-overflow-through-multiple-queues) for how this works and how it was verified.
+
 This solution was created to explore a gap in the standard Unified Routing overflow experience: the native **Work item limit exceeds** condition is not available for record-based queues.
+
+## Version history
+
+| Version | Change |
+| --- | --- |
+| `1.1.0.0` | Added cascading overflow: the flow now walks an entire overflow chain (Queue A → Queue B → Queue C → ...) in a single run instead of stopping after one hop. See [Cascading overflow through multiple queues](#cascading-overflow-through-multiple-queues). |
+| `1.0.0.1` | Added a Filter rows expression to the trigger, restricting flow runs to Case, Email, and Task Queue Items, and added a Queue-type guard so only Entity/Record queues are evaluated. |
+| `1.0.0.0` | Initial release: single-hop overflow based on active, unpicked work item count. |
 
 ## Download
 
-Download the latest unmanaged solution package: **[Overflow.zip](Overflow.zip)** (version `1.0.0.1`).
+Download the latest unmanaged solution package: **[Overflow.zip](Overflow.zip)** (version `1.1.0.0`).
 
 ## Solution contents
 
@@ -116,18 +126,30 @@ The **Queue items** value shown in the page and native views comes from the stan
 
 ## Cloud flow architecture
 
+Version `1.1.0.0` introduces **cascading overflow**: a single flow run now walks the entire overflow chain (Queue A → Queue B → Queue C → ...) instead of stopping after one hop. See [Cascading overflow through multiple queues](#cascading-overflow-through-multiple-queues) below for why this was needed and how it was verified.
+
 ```mermaid
 flowchart TD
-    A[Queue Item is added] --> B[Get source queue]
-    B --> C{Custom overflow configured?}
-    C -- No --> Z[End without action]
-    C -- Yes --> D[Count active unassigned Queue Items]
-    D --> E{Count greater than limit?}
-    E -- No --> Z
-    E -- Yes --> F[Get arriving Queue Item again]
-    F --> G{Still active, unassigned, and in source queue?}
-    G -- No --> Z
-    G -- Yes --> H[Route arriving Queue Item to overflow queue]
+    A[Queue Item is added] --> B[Initialize CurrentQueueId, HopCount, ShouldContinue]
+    B --> L{{Loop: Walk overflow chain}}
+    L --> C[Get current queue]
+    C --> D{Queue configured for overflow?}
+    D -- No --> Stop1[Set ShouldContinue = false]
+    D -- Yes --> E[Count active unassigned Queue Items in current queue]
+    E --> F{Count greater than limit?}
+    F -- No --> Stop2[Set ShouldContinue = false]
+    F -- Yes --> G[Get arriving Queue Item again]
+    G --> H{Still active, unassigned, and in current queue?}
+    H -- No --> Stop3[Set ShouldContinue = false]
+    H -- Yes --> I[Route arriving Queue Item to overflow queue]
+    I --> J[Advance CurrentQueueId to overflow queue]
+    J --> K[Increment HopCount]
+    K --> L
+    Stop1 --> End{ShouldContinue = false OR HopCount >= 10?}
+    Stop2 --> End
+    Stop3 --> End
+    End -- No, loop again --> L
+    End -- Yes, exit loop --> Z[Flow run ends]
 ```
 
 ## Every flow node explained
@@ -150,17 +172,45 @@ objecttypecode eq 112 or objecttypecode eq 4202 or objecttypecode eq 4212
 
 Dataverse evaluates this OData expression before creating a flow run. Other Queue Item types therefore do not consume a run. This was verified with live Queue Items: Case, Email, and Task each started a run, while a Phone Call (`4210`) did not.
 
-The filter identifies the underlying work item type, not the destination queue type. The source Queue is retrieved in the next node so the flow can separately verify that it is an Entity/Record queue.
+The filter identifies the underlying work item type, not the destination queue type. Each queue in the chain is checked separately by the loop below.
 
-The trigger is intentionally reusable. There is one flow for the environment, not one flow per queue. Queues without enabled custom overflow configuration exit at the first condition.
+The trigger is intentionally reusable. There is one flow for the environment, not one flow per queue.
 
 Trigger concurrency is set to **1**. Runs are processed serially so simultaneous arrivals do not all evaluate the same stale queue count in parallel.
 
-### 2. Get source queue
+Critically, the trigger only fires on **Added** (Create), not on Update. The `RouteTo` action used later in the flow updates the Queue Item's `queueid` in place — it does not delete and recreate the record. This means a route never re-fires the trigger on its own; cascading through multiple queues has to happen inside a single flow run, which is exactly what the loop below does.
+
+### 2. Initialize loop variables
+
+**Type:** Three `Initialize variable` actions, run once before the loop.
+
+| Variable | Type | Initial value | Purpose |
+| --- | --- | --- | --- |
+| `CurrentQueueId` | String | The triggering Queue Item's `_queueid_value` | Tracks which queue is being evaluated on the current hop. Updated after each successful route. |
+| `HopCount` | Integer | `0` | Counts how many times the item has been routed in this run. |
+| `ShouldContinue` | Boolean | `true` | Controls whether the loop keeps evaluating another hop. |
+
+### 3. Walk overflow chain (Do Until loop)
+
+**Type:** `Until` loop.
+
+The loop repeats the nodes below until either exit condition is true:
+
+```text
+ShouldContinue = false
+  OR
+HopCount >= 10
+```
+
+`ShouldContinue = false` is the normal exit: the current queue isn't over its limit, isn't configured for overflow, or the item is no longer eligible to move. The `HopCount >= 10` cap is a safety ceiling against a misconfigured circular chain (for example Queue A overflowing to Queue B, which overflows back to Queue A) — it stops the loop after 10 hops rather than looping indefinitely. The loop also has its own built-in `PT10M` (10 minute) timeout as a second safety net.
+
+Each iteration of the loop performs the same sequence of checks as before, but evaluated against `CurrentQueueId` — which starts as the original source queue and advances one hop at a time:
+
+#### 3a. Get current queue
 
 **Type:** Dataverse - Get a row by ID.
 
-The Queue Item trigger provides the ID of the queue that received the work item. This node retrieves that Queue record and reads:
+Retrieves the queue identified by `CurrentQueueId` and reads:
 
 - Queue name.
 - Queue type.
@@ -168,9 +218,7 @@ The Queue Item trigger provides the ID of the queue that received the work item.
 - Work item limit.
 - Overflow queue.
 
-No unrelated Queue fields are required for the overflow decision.
-
-### 3. Custom overflow is configured
+#### 3b. Queue supports overflow
 
 **Type:** Condition.
 
@@ -181,29 +229,25 @@ All four checks must be true:
 3. `dny_workitemlimit` is not null.
 4. `dny_overflowqueueid` is not null.
 
-**If No:** The run ends without counting items or changing the Queue Item.
+**If No:** `ShouldContinue` is set to `false` and the loop exits — this queue is the end of the chain (or was never enabled for overflow).
 
-**If Yes:** The flow continues to count active unpicked items.
+**If Yes:** The flow continues to count active unpicked items in this queue.
 
-This guard avoids unnecessary Dataverse aggregate queries for queues that do not use the custom feature. It also prevents a partial configuration from attempting a route.
-
-### 4. Count active unassigned items
+#### 3c. Count active unassigned items
 
 **Type:** Dataverse - List rows with an aggregate FetchXML query.
 
 The FetchXML query counts Queue Items where:
 
 ```text
-queueid = source queue
+queueid = CurrentQueueId
 statecode = Active
 workerid = null
 ```
 
-The result is returned as `item_count`.
+The result is returned as `item_count`. This node counts unpicked work rather than all records associated with the queue.
 
-This node counts unpicked work rather than all records associated with the queue.
-
-### 5. Limit is exceeded
+#### 3d. Limit is exceeded
 
 **Type:** Condition.
 
@@ -213,22 +257,17 @@ The condition compares:
 item_count > configured work item limit
 ```
 
-The comparison uses **greater than**, not greater than or equal to.
+The comparison uses **greater than**, not greater than or equal to. For a limit of 10, counts 1 through 10 remain in the queue; count 11 enters the Yes branch.
 
-For a limit of 10:
-
-- Counts 1 through 10 remain in the source queue.
-- Count 11 enters the Yes branch.
-
-**If No:** The run ends and the arriving Queue Item remains in the source queue.
+**If No:** `ShouldContinue` is set to `false` and the loop exits — this queue has capacity, so the item stays here.
 
 **If Yes:** The flow rereads the specific arriving Queue Item before moving it.
 
-### 6. Get arriving queue item
+#### 3e. Get arriving queue item
 
 **Type:** Dataverse - Get a row by ID.
 
-Power Automate runs asynchronously. Between the initial trigger and the overflow decision, Unified Routing might assign or move the work item.
+Power Automate runs asynchronously, and this action also runs again on every subsequent hop. Between the initial trigger (or the previous hop's route) and this decision, Unified Routing or an agent might have assigned, closed, or otherwise moved the item.
 
 This node retrieves the arriving Queue Item again and reads:
 
@@ -236,9 +275,9 @@ This node retrieves the arriving Queue Item again and reads:
 - Current Worked By value.
 - Current state.
 
-This is a safety check against routing stale data.
+This is a safety check against routing stale data, re-verified on every hop.
 
-### 7. Item is still eligible
+#### 3f. Item is still eligible
 
 **Type:** Condition.
 
@@ -246,34 +285,50 @@ All three checks must still be true:
 
 1. The Queue Item is active.
 2. Worked By is empty.
-3. The Queue Item is still in the original source queue.
+3. The Queue Item is still in `CurrentQueueId` (the queue this hop is evaluating).
 
-**If No:** The flow stops. It does not take work away from a representative or move an item that another process already handled.
+**If No:** `ShouldContinue` is set to `false` and the loop exits. The flow does not take work away from a representative or move an item that another process already handled.
 
 **If Yes:** The flow routes the item to the configured overflow queue.
 
-### 8. Route to overflow queue
+#### 3g. Route to overflow queue, advance, and increment hop count
 
-**Type:** Dataverse - Perform an unbound action using `RouteTo`.
+**Type:** Dataverse - Perform an unbound action using `RouteTo`, followed by two `Set variable` actions.
 
-The action receives:
+- **Route to overflow queue** receives the configured overflow queue as the target and the Queue Item as the item to route. This changes the Queue Item's `queueid` in place (same `queueitemid`, new queue) and allows Unified Routing to process it from the destination queue.
+- **Advance CurrentQueueId** sets the loop's tracking variable to the queue that was just routed to, so the next iteration evaluates *that* queue's limit.
+- **Increment HopCount** adds 1 to the hop counter.
 
-- The configured overflow Queue as the target.
-- The newly arrived Queue Item as the item to route.
+The loop then re-evaluates from step 3a against the new `CurrentQueueId`. If that queue is also over its limit, the item is routed again in the same run; if not, `ShouldContinue` becomes `false` and the run ends with the item in its final queue.
 
-The supported Dataverse `RouteTo` action changes the Queue Item's queue and allows Unified Routing to process it from the destination queue.
-
-Only the arriving over-limit item is moved. Existing work already waiting in the source queue is not redistributed.
+Only the single arriving over-limit item is ever moved on each hop. Existing backlog already waiting in any queue along the chain is not redistributed.
 
 ![Power Automate flow](docs/images/power-automate-flow.png)
+
+## Cascading overflow through multiple queues
+
+The flow supports **hierarchical overflow chains**: Queue A can overflow to Queue B, and Queue B can independently overflow to Queue C, each with its own work item limit. This was not true in version `1.0.x` — the flow only ever performed one hop per trigger, because `RouteTo` updates the existing Queue Item rather than creating a new one, and the trigger only fires on Create.
+
+Version `1.1.0.0` fixes this by looping through the chain inside a single flow run (see [section 3 above](#3-walk-overflow-chain-do-until-loop)). This was verified live with a three-queue chain (Queue A → Queue B → Queue C), each with a work item limit of 1 and a filler item already occupying Queue A and Queue B:
+
+| Scenario | Expected result | Result |
+| --- | --- | --- |
+| New Case added to Queue A (already at its limit) | Item cascades through Queue B (also at its limit) and lands in Queue C | Passed — confirmed via the Queue Item's final `_queueid_value` |
+| Filler item in Queue A | Stays in Queue A, untouched by the cascading item passing through | Passed |
+| Filler item in Queue B | Stays in Queue B, untouched by the cascading item passing through | Passed |
+| Boundary re-check: single item in an otherwise-empty queue at its limit | Item remains in that queue (count equals, not exceeds, the limit) | Passed |
+
+The filler items staying in place proves each hop's limit is evaluated independently — the loop doesn't just skip through every queue in the chain, it only advances past queues that are genuinely over their configured limit.
+
+A hop cap of 10 prevents an accidental circular configuration (Queue A → Queue B → Queue A) from looping indefinitely; the loop also times out after 10 minutes as a second safety net. Neither limit is expected to be reached in a normal, non-circular hierarchy.
 
 ## Why the flow contains several conditions
 
 The flow could be shorter, but the additional conditions protect active work:
 
-- The first condition avoids processing queues without a complete rule.
-- The count condition implements the actual overflow threshold.
-- The final condition prevents an asynchronous race from moving an item after it has been assigned, closed, or moved elsewhere.
+- The overflow-configuration condition avoids processing queues without a complete rule, and marks the natural end of the chain.
+- The count condition implements the actual overflow threshold at each hop.
+- The eligibility condition prevents an asynchronous race from moving an item after it has been assigned, closed, or moved elsewhere — re-checked on every hop, not just the first.
 
 These are safety checks rather than duplicate business logic.
 
@@ -379,6 +434,9 @@ The cloud flow was tested in an isolated non-production scenario:
 | Over-limit action trace | Count, reread, eligibility check, and `RouteTo` all succeed | Passed |
 | Case, Email, and Task trigger filter | Each allowed type starts a run | Passed |
 | Phone Call trigger filter | Excluded type does not start a run | Passed |
+| Cascading overflow (Queue A → B → C, all at their limit) | Item lands in Queue C within a single flow run | Passed |
+| Cascading overflow — intermediate queue fillers | Filler items in Queue A and Queue B stay in place, untouched | Passed |
+| Cascading overflow — boundary re-check | A single item in an otherwise-empty limited queue still remains there | Passed |
 
 Temporary test queues, tasks, and Queue Items were removed after testing.
 
@@ -395,7 +453,7 @@ Possible customizations include:
 - Adding monitoring, logging, alerts, or an overflow audit table.
 - Changing the Queue Item types allowed by the trigger's **Filter rows** expression.
 - Changing the concurrency and throughput design after load testing.
-- Adding multiple fallback strategies or controlled cascading.
+- Adjusting the hop cap (currently 10) or adding explicit circular-chain detection.
 - Implementing a synchronous plug-in if an asynchronous delay is unacceptable.
 
 ### Generative page files
@@ -425,11 +483,11 @@ That JSON file contains the trigger, conditions, FetchXML aggregate query, safet
 
 - This is an asynchronous cloud-flow design. Overflow normally occurs shortly after item creation, not within the original routing transaction.
 - Trigger concurrency is set to one for predictable counting. High-volume environments must load-test throughput and backlog behavior.
-- The flow checks a point-in-time Dataverse count.
-- Only the new over-limit arrival is moved; existing backlog is not rebalanced.
-- The design provides one-hop routing and does not implement multi-stage cascading.
-- The target queue's own backlog is not evaluated before the route.
-- The generative page validates self-routing and required values. The native form does not add equivalent business rules by default.
+- The flow checks a point-in-time Dataverse count at each hop.
+- Only the new over-limit arrival is moved; existing backlog at any queue in the chain is not rebalanced.
+- The target queue's own backlog is evaluated on the next loop iteration, but only for the single item currently being routed — not proactively for other items already waiting there.
+- Cascading is capped at 10 hops per flow run, with a 10-minute loop timeout as a second safety net. This guards against a misconfigured circular chain (Queue A → Queue B → Queue A) but is not expected to be reached in a normal hierarchy.
+- The generative page validates self-routing and required values. The native form does not add equivalent business rules by default. Neither surface currently validates that a chain of overflow queues does not form a cycle.
 - The trigger starts runs only for Case (`112`), Email (`4202`), and Task (`4212`) Queue Items. Extend the **Filter rows** expression if other record types must participate.
 - The source queue must be an Entity/Record queue and have a complete enabled overflow configuration; otherwise the run exits without routing.
 - The visible standard **Queue items** count is not the same as the active-unpicked count used by the flow.
